@@ -106,11 +106,6 @@ def main():
                         help="Random seed for dataset splitting")
     parser.add_argument("--num_generations", type=int, default=2,
                         help="Number of generations per prompt (must be divisible by batch size)")
-    parser.add_argument("--use_vllm", action="store_true", 
-                        help="Whether to use vLLM for inference (requires a running vLLM server)")
-    parser.add_argument("--no_use_vllm", action="store_false", dest="use_vllm",
-                        help="Disable vLLM usage")
-    parser.set_defaults(use_vllm=False)  # Default to not using vLLM to avoid server issues
     
     args = parser.parse_args()
     
@@ -154,10 +149,10 @@ def main():
         learning_rate=args.lr,
         per_device_train_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
-        use_vllm=args.use_vllm,  # Use the command-line argument
+        use_vllm=True,  # GRPO requires vLLM
         temperature=0.7,
         top_p=0.9,
-        num_generations=args.num_generations,  # Correct parameter name
+        num_generations=args.num_generations,  # Set generations to match batch size
     )
     
     # Initialize the trainer
