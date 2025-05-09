@@ -6,13 +6,17 @@ import argparse
 
 from verifiers.envs.memory_agent.obsidian_agent_env import ObsidianAgentEnv
 from verifiers.trainers import GRPOEnvTrainer
-from verifiers.utils.utils import (
-    make_dataset_from_contexts,
-    add_stop_tokens,
-    compute_reward,
-    compute_all_rewards,
-)
+from verifiers.utils.data_utils import load_memory_dataset, format_dataset
 from trl import GRPOConfig
+
+def format_prompt(user_message, facts=None):
+    """
+    Format a user message into a prompt suitable for the LLM.
+    """
+    if facts:
+        facts_str = "\n".join([f"- {fact['fact_description_or_change']}" for fact in facts])
+        return f"User: {user_message}\n\nRelevant facts to remember:\n{facts_str}"
+    return f"User: {user_message}"
 
 def load_convo_data(convo_file_path):
     """
@@ -40,17 +44,47 @@ def load_convo_data(convo_file_path):
             user_message = chat.get("user_message", "")
             facts_to_check = chat.get("facts_to_check_so_far", [])
             
-            # Create training example
+            # Format the prompt according to the verifiers framework requirements
+            formatted_prompt = format_prompt(user_message, facts_to_check)
+            
+            # Create training example compatible with verifiers
             formatted_data.append({
+                "question": formatted_prompt,  # This becomes the input to the model
+                "answer": "",  # We don't have a specific answer string to check against
+                "task": "memory",  # Custom task type
                 "persona_name": persona_name,
                 "turn_number": turn_number,
                 "base_fact": base_fact,
                 "user_message": user_message,
                 "facts_to_check_so_far": facts_to_check,
-                "context": user_message,  # This will be the main input to the model
             })
     
     return formatted_data
+
+def format_dataset_for_training(dataset):
+    """
+    Format the dataset for training with GRPO.
+    
+    Args:
+        dataset: The dataset to format
+        
+    Returns:
+        The formatted dataset
+    """
+    def format_example(example):
+        # Create chat messages format
+        messages = [
+            {"role": "user", "content": example["question"]}
+        ]
+        
+        return {
+            "prompt": messages,
+            "facts_to_check_so_far": example["facts_to_check_so_far"],
+            "answer": example["answer"],
+            "task": example["task"]
+        }
+    
+    return dataset.map(format_example)
 
 def main():
     parser = argparse.ArgumentParser(description="Train Memory Agent")
@@ -60,33 +94,51 @@ def main():
                         help="Directory to save model and results")
     parser.add_argument("--lr", type=float, default=5e-5, 
                         help="Learning rate for training")
-    parser.add_argument("--batch_size", type=int, default=4, 
+    parser.add_argument("--batch_size", type=int, default=2, 
                         help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=3, 
                         help="Number of epochs for training")
     parser.add_argument("--model_name", type=str, default="gpt-3.5-turbo", 
                         help="Model to use for training")
+    parser.add_argument("--test_size", type=float, default=0.1,
+                        help="Fraction of data to use for testing")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for dataset splitting")
     
     args = parser.parse_args()
     
     # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Load the conversation data
+    # Load the memory dataset
     data_path = Path(args.data_path).resolve()
     print(f"Loading data from {data_path}")
-    training_data = load_convo_data(data_path)
     
-    # Create a dataset from the training data
-    dataset = Dataset.from_list(training_data)
+    # Load and preprocess the dataset using the utility function
+    dataset = load_memory_dataset(
+        file_path=data_path,
+        test_size=args.test_size,
+        seed=args.seed
+    )
     
-    # Split dataset into train and eval
-    dataset = dataset.train_test_split(test_size=0.1)
+    # Split into train and test
+    splits = dataset.train_test_split(test_size=args.test_size, seed=args.seed)
+    
+    # Format the datasets for training (add system prompt and format as chat)
+    train_dataset = format_dataset(
+        splits["train"],
+        system_prompt=None,  # System prompt is handled by the environment
+    )
+    
+    eval_dataset = format_dataset(
+        splits["test"],
+        system_prompt=None,  # System prompt is handled by the environment
+    )
     
     # Initialize the environment
     env = ObsidianAgentEnv(
-        dataset=dataset["train"],
-        eval_dataset=dataset["test"],
+        dataset=train_dataset,
+        eval_dataset=eval_dataset,
     )
     
     # Configure GRPO training
@@ -106,34 +158,12 @@ def main():
         env=env,
         reward_funcs=env.get_reward_funcs(),
         args=grpo_config,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset["test"],
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
     )
     
     # Train the model
     trainer.train()
-    
-    # Print some evaluation metrics
-    rewards = compute_all_rewards(
-        completions=trainer.eval_completions,
-        env=env,
-        eval_dataset=dataset["test"],
-    )
-    
-    print("Evaluation Rewards:")
-    for i, reward in enumerate(rewards):
-        print(f"Example {i+1}: {reward}")
-    
-    print(f"Average Reward: {sum(rewards) / len(rewards)}")
-    
-    # Save the final results
-    results = {
-        "rewards": rewards,
-        "avg_reward": sum(rewards) / len(rewards) if rewards else 0,
-    }
-    
-    with open(os.path.join(args.output_dir, "eval_results.json"), "w") as f:
-        json.dump(results, f, indent=2)
     
     print(f"Training complete! Results saved to {args.output_dir}")
 
